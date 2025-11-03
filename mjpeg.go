@@ -361,7 +361,6 @@ func (m *Mjpeg) processAndSendImage(jpegData []byte, timerStarted *bool) {
 
 func (m *Mjpeg) decodeStream(reader *bufio.Reader, boundary string) {
 	defer m.wg.Done()
-	imgcounter := 0 // This variable is not used after refactoring, can be removed later if not needed.
 	timerStarted := false
 	m.logf("Starting decodeStream goroutine")
 
