@@ -75,13 +75,8 @@ type Mjpeg struct {
 	timer     *time.Timer
 }
 
-// NewMjpeg creates a new Mjpeg client with the given options.
-// It loads environment variables from a .env file to override the options.
-func NewMjpeg(opts MjpegOpts) *Mjpeg {
-	// Load environment variables from .env file
-	godotenv.Load()
-
-	// Override opts with environment variables if they exist
+// loadEnvOverrides loads environment variables from a .env file and overrides the MjpegOpts fields if the corresponding environment variables are set.
+func loadEnvOverrides(opts *MjpegOpts) {
 	if url := os.Getenv("MJPEG_URL"); url != "" {
 		opts.URL = url
 	}
@@ -110,6 +105,13 @@ func NewMjpeg(opts MjpegOpts) *Mjpeg {
 			opts.EnableLog = val
 		}
 	}
+}
+
+// NewMjpeg creates a new Mjpeg client with the given options.
+// It loads environment variables from a .env file to override the options.
+func NewMjpeg(opts MjpegOpts) *Mjpeg {
+	godotenv.Load()
+	loadEnvOverrides(&opts)
 
 	m := &Mjpeg{
 		opts:           opts,
@@ -217,6 +219,38 @@ func (m *Mjpeg) ResetTimer(duration int) {
 	})
 }
 
+// getStreamResponse handles making the HTTP GET request and returns the response.
+func (m *Mjpeg) getStreamResponse() (*http.Response, error) {
+	res, err := http.Get(m.opts.URL)
+	if err != nil {
+		return nil, fmt.Errorf("error getting response from server: %w", err)
+	}
+	m.logf("Got response from server: %s", res.Status)
+	return res, nil
+}
+
+// parseContentTypeAndBoundary parses the Content-Type header to extract the boundary string.
+func (m *Mjpeg) parseContentTypeAndBoundary(contentType string) (string, error) {
+	m.logf("Content-Type: %v", contentType)
+	boundary := ""
+	if strings.HasPrefix(contentType, "multipart/x-mixed-replace") {
+		parts := strings.Split(contentType, ";")
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			if strings.HasPrefix(part, "boundary=") {
+				boundary = "--" + strings.TrimPrefix(part, "boundary=")
+				break
+			}
+		}
+	}
+
+	if boundary == "" {
+		m.logf("Error: Could not find boundary in Content-Type header. Assuming default '--frame'")
+		boundary = "--frame"
+	}
+	return boundary, nil
+}
+
 func (m *Mjpeg) startFetching() {
 	var reader *bufio.Reader
 	var res *http.Response
@@ -240,33 +274,22 @@ func (m *Mjpeg) startFetching() {
 				m.setStatusCode(StatusPlaying)
 
 				var err error
-				res, err = http.Get(m.opts.URL)
+
+				res, err = m.getStreamResponse()
 				if err != nil {
-					m.logf("Error getting response from server: %v", err)
+					m.logf("Error getting response: %v", err)
 					m.setStatusCode(StatusError)
 					return
 				}
-				m.logf("Got response from server: %s", res.Status)
 
 				contentType := res.Header.Get("Content-Type")
-				m.logf("Content-Type: %v", contentType)
-
-				boundary := ""
-				if strings.HasPrefix(contentType, "multipart/x-mixed-replace") {
-					parts := strings.Split(contentType, ";")
-					for _, part := range parts {
-						part = strings.TrimSpace(part)
-						if strings.HasPrefix(part, "boundary=") {
-							boundary = "--" + strings.TrimPrefix(part, "boundary=")
-							break
-						}
-					}
+				boundary, err := m.parseContentTypeAndBoundary(contentType)
+				if err != nil {
+					m.logf("Error parsing content type and boundary: %v", err)
+					m.setStatusCode(StatusError)
+					return
 				}
 
-				if boundary == "" {
-					m.logf("Error: Could not find boundary in Content-Type header. Assuming default '--frame'")
-					boundary = "--frame"
-				}
 				reader = bufio.NewReader(res.Body)
 				m.wg.Add(1)
 				go m.decodeStream(reader, boundary)
@@ -286,17 +309,82 @@ func (m *Mjpeg) startFetching() {
 	}
 }
 
+// readImageHeaders reads headers for a JPEG image part and returns its Content-Length.
+func (m *Mjpeg) readImageHeaders(reader *bufio.Reader) (int, error) {
+	var contentLength int
+	for {
+		headerLine, err := reader.ReadString('\n')
+		if err != nil {
+			return 0, fmt.Errorf("error reading header: %w", err)
+		}
+
+		if strings.TrimSpace(headerLine) == "" {
+			break // End of headers
+		}
+
+		if strings.HasPrefix(headerLine, "Content-Length:") {
+			fmt.Sscanf(headerLine, "Content-Length: %d", &contentLength)
+		}
+	}
+	return contentLength, nil
+}
+
+// processAndSendImage decodes JPEG data and sends it to the ImageStream.
+// It also manages the auto-stop timer.
+func (m *Mjpeg) processAndSendImage(jpegData []byte, timerStarted *bool) {
+	if len(jpegData) == 0 {
+		return
+	}
+
+	img, err := jpeg.Decode(bytes.NewReader(jpegData))
+	if err != nil {
+		m.logf("Error decoding JPEG: %v", err)
+		return
+	}
+
+	// TODO: Implement image resizing if m.opts.Resize is true
+
+	// Non-blocking write to ImageStream
+	select {
+	case m.ImageStream <- img:
+		if !*timerStarted && m.opts.AutoStopTimer > 0 {
+			m.logf("\nFirst image received. Starting AutoStopTimer for %d seconds.", m.opts.AutoStopTimer)
+			m.timer = time.AfterFunc(time.Duration(m.opts.AutoStopTimer)*time.Second, func() {
+				m.Stop()
+			})
+			*timerStarted = true
+		}
+	default:
+		// ImageStream is full, drop the image
+	}
+}
+
 func (m *Mjpeg) decodeStream(reader *bufio.Reader, boundary string) {
 	defer m.wg.Done()
-	imgcounter := 0
+	imgcounter := 0 // This variable is not used after refactoring, can be removed later if not needed.
 	timerStarted := false
 	m.logf("Starting decodeStream goroutine")
+
 	for {
 		select {
 		case <-m.stopDecodeCh:
 			m.logf("Stopping decodeStream goroutine")
 			return
+		case control := <-m.internalCH:
+			switch control {
+			case PauseStream:
+				m.setStatusCode(StatusPaused)
+				continue
+			case ResumeStream:
+				m.setStatusCode(StatusPlaying)
+				continue
+			}
 		default:
+			if m.statusCode == StatusPaused {
+				time.Sleep(100 * time.Millisecond) // Prevent busy-waiting
+				continue
+			}
+
 			line, err := reader.ReadString('\n')
 			if err != nil {
 				if err == io.EOF {
@@ -308,72 +396,22 @@ func (m *Mjpeg) decodeStream(reader *bufio.Reader, boundary string) {
 			}
 
 			if strings.Contains(line, boundary) {
-				var contentLength int
-				for {
-					headerLine, err := reader.ReadString('\n')
-					if err != nil {
-						m.logf("Error reading header: %v", err)
-						m.setStatusCode(StatusError)
-						return
-					}
-
-					if strings.TrimSpace(headerLine) == "" {
-						break
-					}
-
-					if strings.HasPrefix(headerLine, "Content-Length:") {
-						fmt.Sscanf(headerLine, "Content-Length: %d", &contentLength)
-					}
-				}
-				// Check for control status.. if has to be paused..
-				select {
-				case control := <-m.internalCH:
-					switch control {
-					case PauseStream:
-						m.setStatusCode(StatusPaused)
-						continue
-					case ResumeStream:
-						m.setStatusCode(StatusPlaying)
-						continue
-					}
-				default:
-					if m.statusCode != StatusPaused {
-						var jpegData []byte
-						if contentLength > 0 {
-							jpegData = make([]byte, contentLength)
-							_, err = io.ReadFull(reader, jpegData)
-							if err != nil {
-								m.logf("Error reading JPEG data: %v", err)
-								m.setStatusCode(StatusError)
-								continue
-							}
-						}
-
-						if len(jpegData) > 0 {
-							img, err := jpeg.Decode(bytes.NewReader(jpegData))
-							if err != nil {
-								m.logf("Error decoding JPEG: %v", err)
-								continue
-							}
-
-							// Non-blocking write to ImageStream
-							select {
-							case m.ImageStream <- img:
-								imgcounter++
-								if !timerStarted && m.opts.AutoStopTimer > 0 {
-									m.logf("\nFirst image received. Starting AutoStopTimer for %d seconds.", m.opts.AutoStopTimer)
-									m.timer = time.AfterFunc(time.Duration(m.opts.AutoStopTimer)*time.Second, func() {
-										m.Stop()
-									})
-									timerStarted = true
-								}
-							default:
-							}
-						}
-					}
-
+				contentLength, err := m.readImageHeaders(reader)
+				if err != nil {
+					m.logf("Error reading image headers: %v", err)
+					m.setStatusCode(StatusError)
+					continue
 				}
 
+			jpegData := make([]byte, contentLength)
+			_, err = io.ReadFull(reader, jpegData)
+			if err != nil {
+				m.logf("Error reading JPEG data: %v", err)
+				m.setStatusCode(StatusError)
+				continue
+			}
+
+			m.processAndSendImage(jpegData, &timerStarted)
 			}
 		}
 	}
