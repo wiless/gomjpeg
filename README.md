@@ -1,4 +1,4 @@
-# Golang GOMJPEG package
+# Golang GOMJPEG package [![GoDoc](https://pkg.go.dev/badge/github.com/wiless/gomjpeg.svg)](https://pkg.go.dev/github.com/wiless/gomjpeg)
 
 This is golang mjpeg package that can be used to fetch images from a mjpeg stream in background and convert to golang image. This can be used by applications to render to x11 window or save to local files.
 
